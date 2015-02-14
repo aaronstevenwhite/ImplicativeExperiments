@@ -1,8 +1,3 @@
-import pymc, theano
-import numpy as np
-import scipy as sp
-
-# import relevant modules
 import sys, os, re, argparse, itertools
 import theano, pymc
 import numpy as np
@@ -15,30 +10,36 @@ import scipy as sp
 ##################
 
 ## initialize parser
-parser = argparse.ArgumentParser(description='Load data and run likert factor analysis.')
+parser = argparse.ArgumentParser(description='Load data and run implicatives model.')
 
 ## file handling
-parser.add_argument('--verbs', 
-                    type=str, 
-                    default='../materials/triad/lists/verbs.list')
 parser.add_argument('--data', 
                     type=str, 
-                    default='../data/frame/frame.filtered')
+                    default='../data/results.filtered')
 parser.add_argument('--output', 
                     type=str, 
                     default='./model')
 
-## general model settings
+## model structure settings
 parser.add_argument('--nonparametric', 
                     nargs='?', 
                     const=True, 
                     default=False)
-
-## feature/category model settings
 parser.add_argument('--featureprior',
                     type=str, 
                     choices=['beta', 'dirichlet'], 
                     default='beta')
+parser.add_argument('--featurebynegtype', 
+                    nargs='?', 
+                    const=True, 
+                    default=False)
+parser.add_argument('--cutpoints',
+                    type=str, 
+                    choices=['equidistant', 'direction', 'negtype', 'direction+negtype'], 
+                    default='equidistant')
+
+
+## model hyperparameters
 parser.add_argument('--featuresparsity', 
                     type=float, 
                     default=1.)
@@ -46,11 +47,9 @@ parser.add_argument('--strengthprior',
                     type=str, 
                     choices=['exponential', 'laplace'], 
                     default='exponential')
-
-## inference strength model settings
 parser.add_argument('--strengthlevels', 
                     type=int, 
-                    default=1)
+                    default=2)
 parser.add_argument('--strengthsparsity', 
                     type=float, 
                     default=1.)
@@ -64,11 +63,15 @@ parser.add_argument('--loadstrengthlevels',
                     nargs='?',
                     const=True,
                     default=False)
-parser.add_argument('--loadjump', 
+parser.add_argument('--loadsubjbias', 
                     nargs='?',
                     const=True,
                     default=False)
-parser.add_argument('--loaditem', 
+parser.add_argument('--loaditembias', 
+                    nargs='?',
+                    const=True,
+                    default=False)
+parser.add_argument('--loadresponseerror', 
                     nargs='?',
                     const=True,
                     default=False)
@@ -87,6 +90,12 @@ parser.add_argument('--thinning',
 ## parse arguments
 args = parser.parse_args()
 
+## raise error for unimplemented combinations
+if args.featureprior == 'dirichlet' and args.featurebynegtype:
+    ## the current issue with this model is that pymc.Multinomial cannot take
+    ## values that are tensors of order greater than 2 (matrices)
+    raise NotImplementedError, 'this dirichlet model is not yet implemented'
+
 ####################
 ## utility functions
 ####################
@@ -102,7 +111,7 @@ def map_vals_to_indices(col, vals=[]):
 ############
 
 ## read filtered data file
-data = np.loadtxt('/home/aaronsteven/experiments/ImplicativeExperiments/results_final.filtered', 
+data = np.loadtxt(args.data, 
                   delimiter=',', 
                   dtype=np.str,
                   skiprows=1)
@@ -110,142 +119,190 @@ data = np.loadtxt('/home/aaronsteven/experiments/ImplicativeExperiments/results_
 ## uncomment to look only at matrix positive and matrix negative
 #data = data[np.logical_or(data[:,3] == 'negative', data[:,3] == 'positive'), ]
 
-verb_vals = np.array(['manage', 'opt', 'remember', 'think', 'know', 'hasten', 
-                      'hesitate', 'mean', 'refuse', 'forget', 'neglect', 'fail', 
-                      'want', 'hope'])
+## set verb order (this is important to ensure "want" and "hope" are treated as baselines)
+verb_vals = ['manage', 'opt', 'remember', 'think', 'know', 'hasten', 
+             'hesitate', 'mean', 'refuse', 'forget', 'neglect', 'fail',
+             'want', 'hope']
+baseline_verb_vals = np.array(['want', 'hope'])
 
+## extract data
 subj_vals, subj_indices = map_vals_to_indices(data[:,0])
 item_vals, item_indices = map_vals_to_indices(data[:,1])
-_, verb_indices = map_vals_to_indices(data[:,2], verb_vals)
+verb_vals, verb_indices = map_vals_to_indices(data[:,2], verb_vals)
 negation_vals, negtype_indices = map_vals_to_indices(data[:,3])
 response_vals, response_indices = map_vals_to_indices(data[:,4], ['positive', 'soft', 'negative'])
 reaction_times = data[:,5]
 
+## set constants
 num_of_subjects = subj_vals.shape[0]
 num_of_items = item_vals.shape[0]
 num_of_verbs = verb_vals.shape[0]
+num_of_baseline_verbs = baseline_verb_vals.shape[0]
 num_of_negtypes = negation_vals.shape[0]
-
 num_of_observations = data.shape[0]
 
+#################
+## initialization
+#################
+
+def get_verb_features_shape(initial_dim=num_of_verbs-num_of_baseline_verbs, 
+                            final_dim=args.strengthlevels-1):
+    if args.featurebynegtype:
+        return (initial_dim, num_of_negtypes, final_dim)
+    else:
+        return (initial_dim, final_dim)
+
+def get_strength_shape():
+    if args.featurebynegtype:
+        return args.strengthlevels
+    else:
+        return (args.strengthlevels, num_of_negtypes)
+
+
+def initialize_feature_prior():
+    if args.featureprior == 'beta':
+        return sp.stats.beta.rvs(a=args.featuresparsity,
+                                 b=1., 
+                                 size=args.strengthlevels-1)
+
+    elif args.featureprior == 'dirichlet':
+        if args.nonparametric:
+            return sp.stats.beta.rvs(a=1.,
+                                     b=args.featuresparsity,
+                                     size=args.strengthlevels-1)
+        else:
+            return sp.stats.dirichlet(args.featuresparsity*np.ones(args.strengthlevels-1))
+
+def initialize_verb_features():
+    if args.loadverbfeatures:
+        raise NotImplementedError
+    else:
+        return sp.stats.bernoulli.rvs(.5, size=get_verb_features_shape())
+
+################
 ## feature model
-
-# sparsity_hyperprior = 2.
-
-# feature_sparsity = pymc.Exponential(name='feature_sparsity',
-#                                     beta=sparsity_hyperprior,
-#                                     value=sp.stats.expon.rvs(scale=sparsity_hyperprior),
-#                                     observed=False)
-
-
-# feature_prob = pymc.Beta(name='feature_prob',
-#                          alpha=feature_sparsity,
-#                          beta=1.,
-#                          value=sp.stats.beta.rvs(a=feature_sparsity,#1./sparsity_hyperprior,
-#                                                  b=1., 
-#                                                  size=args.strengthlevels-1),
-#                          observed=False)
-
-# @pymc.deterministic(trace=False)
-# def ibp_stick(feature_prob=feature_prob):
-#     probs = np.cumprod(feature_prob)
-
-#     return np.tile(probs, (num_of_verbs-2, num_of_negtypes, 1))
-
-# verb_features = pymc.Bernoulli(name='verb_features',
-#                                p=ibp_stick,
-#                                value=sp.stats.bernoulli.rvs(.1, size=(num_of_verbs-2,
-#                                                                       num_of_negtypes,
-#                                                                       args.strengthlevels-1)),
-#                                observed=False)
-
-## feature model
+################
 
 if args.featureprior == 'beta':
-    feature_prob = pymc.Beta(name='feature_prob',
-                             alpha=args.featuresparsity,
-                             beta=1.,
-                             value=sp.stats.beta.rvs(a=args.featuresparsity,
-                                                     b=1., 
-                                                     size=args.featurenum),
-                             observed=False)
-
-if args.featureprior == 'dirichlet':
-    prior_param = np.ones(args.featurenum)*args.featuresparsity
-    feature_prob = pymc.Beta(name='feature_prob',
-                             theta=prior_param,
-                             value=sp.stats.beta.rvs(alpha=prior_param),
-                             observed=False)
-
-
-if args.nonparametric:
-    @pymc.deterministic(trace=False)
-    def ibp_stick(feature_prob=feature_prob):
-        probs = np.cumprod(feature_prob)
-
-        return np.tile(probs, (num_of_verbs,1))
-
-
-    verb_features = pymc.Bernoulli(name='verb_features',
-                                   p=ibp_stick,
-                                   value=initialize_verb_features(),
-                                   observed=False)
-
-else:
-
-    @pymc.deterministic(trace=False)
-    def feature_prob_tile(probs=feature_prob):
-        return np.tile(probs, (num_of_verbs,1))
-
-    
-    verb_features = pymc.Bernoulli(name='verb_features',
-                                   p=feature_prob_tile,
-                                   value=initialize_verb_features(),
-                                   observed=False)
-
-
-feature_prob = pymc.Beta(name='feature_prob',
+    raw_prob = pymc.Beta(name='raw_prob',
                          alpha=args.featuresparsity,
                          beta=1.,
-                         value=sp.stats.beta.rvs(a=args.featuresparsity,
-                                                 b=1., 
-                                                 size=args.strengthlevels-1),
+                         value=initialize_feature_prior(),
                          observed=False)
 
-@pymc.deterministic(trace=False)
-def feature_prob_tile(probs=feature_prob):
-    return np.tile(probs, (num_of_verbs-2, num_of_negtypes, 1))
+    if args.nonparametric:
+        @pymc.deterministic(trace=False)
+        def feature_prob(raw_probs=raw_prob):
+            return np.tile(np.cumprod(raw_probs), 
+                           get_verb_features_shape(final_dim=1))
+
+    else:
+        @pymc.deterministic(trace=False)
+        def feature_prob(raw_probs=raw_prob):
+            return np.tile(raw_probs, 
+                           get_verb_features_shape(final_dim=1))
+
+    verb_features = pymc.Bernoulli(name='verb_features',
+                                   p=feature_prob,
+                                   value=initialize_verb_features(),
+                                   observed=False)
 
 
-verb_features = pymc.Bernoulli(name='verb_features',
-                               p=feature_prob_tile,
-                               value=sp.stats.bernoulli.rvs(.5, size=(num_of_verbs-2,
-                                                                      num_of_negtypes,
-                                                                      args.strengthlevels-1)),
-                               observed=False)
+elif args.featureprior == 'dirichlet':
+
+    if args.nonparametric:
+        raw_prob = pymc.Beta(name='raw_prob',
+                                 alpha=1.,
+                                 beta=args.featuresparsity,
+                                 value=initialize_feature_prior(),
+                                 observed=False)
+
+        @pymc.deterministic(trace=False)
+        def feature_prob(raw_probs=raw_prob):
+            raw_probs_flipped = np.append(1., np.cumprod(1-raw_probs))
+
+            return np.tile(raw_probs*raw_probs_flipped, 
+                           get_verb_features_shape(final_dim=1))
+
+    else:
+        dir_hyperparameter = args.featuresparsity*np.ones(args.strengthlevels)
+        raw_prob = pymc.Dirichlet(name='feature_prob',
+                                      theta=dir_hyperparameter,
+                                      value=initialize_feature_prior(),
+                                      observed=False)
+
+        @pymc.deterministic(trace=False)
+        def feature_prob(raw_probs=raw_prob):
+            return np.tile(raw_probs, 
+                           get_verb_features_shape(final_dim=1))    
+
+
+        verb_features = pymc.Multinomial(name='verb_features',
+                                         n=1,
+                                         p=feature_prob,
+                                         value=initialize_verb_features(),
+                                         observed=False)
+
 
 @pymc.deterministic
 def verb_features_with_controls_and_intercept(verb_features=verb_features):
-    verb_features_with_controls = np.append(verb_features, np.zeros([2, num_of_negtypes, args.strengthlevels-1]), axis=0)
-    
-    return np.append(np.ones([num_of_verbs, num_of_negtypes, 1]), verb_features_with_controls, axis=2)
+    control_shape = get_verb_features_shape(initial_dim=num_of_baseline_verbs)
+    verb_features_with_controls = np.append(verb_features, 
+                                            np.zeros(control_shape), 
+                                            axis=0)
+
+    return np.append(np.ones(get_verb_features_shape(initial_dim=num_of_verbs, 
+                                                     final_dim=1)),
+                     verb_features_with_controls, 
+                     axis=len(control_shape)-1)
 
 
-## strength model
+##########################
+## strength/polarity model
+##########################
 
-strength = pymc.Exponential(name='strength',
-                            beta=1.,
-                            value=sp.stats.expon.rvs(scale=1.,
-                                                     size=args.strengthlevels),
-                            observed=False)
+if args.strengthprior=='exponential':
+    strength = pymc.Exponential(name='strength',
+                                beta=1.,
+                                value=sp.stats.expon.rvs(scale=1.,
+                                                         size=get_strength_shape()),
+                                observed=False)
 
-## polarity model
+    polarity = pymc.Bernoulli(name='polarity',
+                              p=.5,
+                              value=sp.stats.bernoulli.rvs(.5, size=(num_of_verbs, 
+                                                                     num_of_negtypes)),
+                              observed=False)
 
-polarity = pymc.Bernoulli(name='polarity',
-                          p=.5,
-                          value=sp.stats.bernoulli.rvs(.5, size=(num_of_verbs, 
-                                                                 num_of_negtypes)),
-                          observed=False)
+    @pymc.deterministic
+    def entailment(features=verb_features_with_controls_and_intercept, strength=strength, polarity=polarity):
+        return np.where(polarity == 1, 1, -1) * np.dot(features, strength)
+
+
+elif args.strengthprior=='laplace':
+    ## pymc has a laplace distribution but its matrix form is broken
+    ## the following formulation involving exponentials is equivalent
+    ## (see wikipedia)
+    strength1 = pymc.Exponential(name='strength1',
+                                beta=1.,
+                                value=sp.stats.expon.rvs(scale=1.,
+                                                         size=get_strength_shape()),
+                                observed=False)
+
+    strength2 = pymc.Exponential(name='strength2',
+                                beta=1.,
+                                value=sp.stats.expon.rvs(scale=1.,
+                                                         size=get_strength_shape()),
+                                observed=False)
+
+    @pymc.deterministic
+    def strength(strength1=strength1, strength2=strength2):
+        return strength1 - strength2
+
+    @pymc.deterministic
+    def entailment(features=verb_features_with_controls_and_intercept, strength=strength):
+        return np.dot(features, strength)
+
 
 #################
 ## random effects
@@ -258,13 +315,14 @@ subj_bias_prior = pymc.Exponential(name='subj_bias_prior',
                                    value=sp.stats.expon.rvs(scale=1., size=num_of_negtypes),
                                    observed=False)
 
-# @pymc.deterministic(trace=False)
-# def subj_bias_prior_tile(prior=subj_bias_prior):
-#     return np.tile(prior, (num_of_subjects, 1))
+
+@pymc.deterministic(trace=False)
+def subj_bias_prior_tile(prior=subj_bias_prior):
+    return np.tile(prior, (num_of_subjects, 1))
 
 subj_bias = pymc.Normal(name='subj_bias',
                         mu=0.,
-                        tau=subj_bias_prior,
+                        tau=subj_bias_prior_tile,
                         value=np.random.normal(0., 
                                                1.,
                                                size=(num_of_subjects, 
@@ -278,13 +336,13 @@ item_bias_prior = pymc.Exponential(name='item_bias_prior',
                                    value=sp.stats.expon.rvs(scale=1., size=num_of_negtypes),
                                    observed=False)
 
-# @pymc.deterministic(trace=False)
-# def item_bias_prior_tile(prior=item_bias_prior):
-#     return np.tile(prior, (num_of_items, 1))
+@pymc.deterministic(trace=False)
+def item_bias_prior_tile(prior=item_bias_prior):
+    return np.tile(prior, (num_of_items, 1))
 
 item_bias = pymc.Normal(name='item_bias',
                         mu=0.,
-                        tau=item_bias_prior,
+                        tau=item_bias_prior_tile,
                         value=np.random.normal(0., 
                                                1.,
                                                size=(num_of_items, 
@@ -319,23 +377,51 @@ response_error = pymc.Bernoulli(name='response_error',
 
 ## response model
 
-cutpoint = pymc.Exponential(name='cutpoints',
-                            beta=1.,
-                            value=np.ones(2),
-                            observed=False)
+if args.cutpoints == 'equidistant':
+    cutpoint_val = pymc.Exponential(name='cutpoint_val',
+                                    beta=1.,
+                                    value=1.,
+                                    observed=False)
+
+    @pymc.deterministic
+    def cutpoints(cutpoint_val=cutpoint_val):
+        return np.tile(cutpoint_val, [2, num_of_negtypes])
+
+elif args.cutpoints == 'direction':
+    cutpoint_val = pymc.Exponential(name='cutpoint_val',
+                                beta=1.,
+                                value=np.ones(2),
+                                observed=False)
+
+    @pymc.deterministic
+    def cutpoints(cutpoint_val=cutpoint_val):
+        return np.tile(cutpoint_val, [1, num_of_negtypes])
+
+elif args.cutpoints == 'negtype':
+    cutpoint_val = pymc.Exponential(name='cutpoint_val',
+                                beta=1.,
+                                value=np.ones(num_of_negtypes),
+                                observed=False)
+
+    @pymc.deterministic
+    def cutpoints(cutpoint_val=cutpoint_val):
+        return np.tile(cutpoint_val, [2, 1])
+
+elif args.cutpoints == 'direction+negtype':
+    cutpoints = pymc.Exponential(name='cutpoints',
+                                 beta=1.,
+                                 value=np.ones([2, num_of_negtypes]),
+                                 observed=False)
 
 @pymc.deterministic
-def entailment(features=verb_features_with_controls_and_intercept, strength=strength, polarity=polarity):
-    return np.where(polarity == 1, 1, -1) * np.dot(features, strength)
-
-@pymc.deterministic
-def response_prob(entailment=entailment, subj_bias=subj_bias, item_bias=item_bias, response_error=response_error, cutpoint=cutpoint):
+def response_prob(entailment=entailment, subj_bias=subj_bias, item_bias=item_bias, response_error=response_error, cutpoints=cutpoints):
     bias = subj_bias[subj_indices, negtype_indices] + item_bias[item_indices, negtype_indices]
     direction =  np.where(response_error == 1, -1, 1)
 
     perceived_entailment = direction * entailment[verb_indices, negtype_indices] / bias
 
-    cumprobs = pymc.invlogit(np.array([perceived_entailment-cutpoint[0], perceived_entailment+cutpoint[1]]).transpose())
+    cumprobs = pymc.invlogit(np.array([perceived_entailment-cutpoints[0, negtype_indices], 
+                                       perceived_entailment+cutpoints[1, negtype_indices]]).transpose())
 
     zeros = np.zeros(num_of_observations)[:, None]
     ones = np.ones(num_of_observations)[:, None]
