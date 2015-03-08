@@ -18,4 +18,4 @@ This directory contains the raw data file pulled from Ibex (`results.ibex`) as w
 
 ### analysis/
 
-This directory contains preprocessing (`preprocess.py`), filtering (`filter.R`), and analysis/plotting (`analysis.R`) scripts as well as an implementation (`model.py`) of various computational models of the contradiction detection task.
+This directory contains preprocessing (`preprocess.py`) and filtering (`filter.R`) scripts as well as an implementation (`model.py`) of various computational models of the contradiction detection task.
