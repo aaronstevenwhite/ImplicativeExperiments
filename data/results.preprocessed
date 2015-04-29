@@ -1,4 +1,4 @@
-subj,item,verb,negation,followup,itemtype,response,rt
+subj,item,verb,frame,followup,itemtype,response,rt
 75b3f33781fcda63eefb3971194d598d,customer,think,embhighneg,negative,test,Must be true,3362
 75b3f33781fcda63eefb3971194d598d,customer,hesitate,embhighneg,positive,test,Could be true or false,2346
 75b3f33781fcda63eefb3971194d598d,author,remember,negative,negative,finite,Could be true or false,6831
